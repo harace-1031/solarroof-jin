@@ -2,6 +2,7 @@
 import io,json,mimetypes,os,secrets,threading,urllib.parse
 from pathlib import Path
 import server as core
+import search_records
 ROOT=Path(__file__).resolve().parent
 TOKEN=secrets.token_urlsafe(32)
 CALC=threading.BoundedSemaphore(1)
@@ -11,7 +12,7 @@ LOOKUP=threading.BoundedSemaphore(3)
 def application(env,start_response):
     def reply(data,status=200,kind='application/json; charset=utf-8',extra=()):
         if not isinstance(data,bytes):data=json.dumps(data,ensure_ascii=False).encode()
-        reason={200:'OK',400:'Bad Request',403:'Forbidden',404:'Not Found',405:'Method Not Allowed',413:'Content Too Large',422:'Unprocessable Entity',502:'Bad Gateway',503:'Service Unavailable'}.get(status,'Error')
+        reason={200:'OK',400:'Bad Request',403:'Forbidden',404:'Not Found',405:'Method Not Allowed',413:'Content Too Large',422:'Unprocessable Entity',429:'Too Many Requests',502:'Bad Gateway',503:'Service Unavailable'}.get(status,'Error')
         start_response(f'{status} {reason}',[('Content-Type',kind),('Content-Length',str(len(data))),('Cache-Control','no-store'),('X-Content-Type-Options','nosniff'),('Referrer-Policy','same-origin'),*extra])
         return [b'' if env.get('REQUEST_METHOD')=='HEAD' else data]
     path=env.get('PATH_INFO','/');method=env.get('REQUEST_METHOD','GET');host=env.get('HTTP_HOST','').lower()
@@ -22,7 +23,25 @@ def application(env,start_response):
     if method not in ('GET','HEAD','POST'):return reply({'error':'허용되지 않은 요청입니다.'},405)
     q=urllib.parse.parse_qs(env.get('QUERY_STRING',''));slot=None
     try:
-        if path=='/api/health':return reply({'status':'ok','app':'SOLARROOF_JIN','version':'20261029-render-1'})
+        if path in ('/admin','/admin/') and method in ('GET','HEAD'):
+            return reply((ROOT/'static/admin.html').read_bytes(),kind='text/html; charset=utf-8')
+        if path=='/admin/export':
+            if method!='POST':return reply({'error':'관리자 화면에서 비밀번호를 입력하세요.'},405)
+            origin=env.get('HTTP_ORIGIN')
+            if origin and origin not in ('https://'+host,'http://'+host if host.split(':')[0] in ('localhost','127.0.0.1') else 'https://'+host):return reply({'error':'허용되지 않은 요청입니다.'},403)
+            size=int(env.get('CONTENT_LENGTH') or '0')
+            if not 0<size<=4096:return reply({'error':'잘못된 요청입니다.'},400)
+            form=urllib.parse.parse_qs(env['wsgi.input'].read(size).decode())
+            auth=search_records.authenticate(form.get('password',[''])[0])
+            if auth!='ok':
+                code=429 if auth=='limited' else 503 if auth=='disabled' else 403
+                msg='잠시 후 다시 시도하세요.' if auth=='limited' else 'Render에 ADMIN_PASSWORD를 설정하세요.' if auth=='disabled' else '관리자 비밀번호가 일치하지 않습니다.'
+                return reply(msg.encode(),code,'text/plain; charset=utf-8')
+            try:
+                body=search_records.workbook(search_records.addresses())
+                return reply(body,kind='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',extra=[('Content-Disposition','attachment; filename="SOLARROOF_JIN_buildings.xlsx"')])
+            except Exception as error:return reply(('저장소 연결 실패: '+search_records.storage_error(error)).encode(),502,'text/plain; charset=utf-8')
+        if path=='/api/health':return reply({'status':'ok','app':'SOLARROOF_JIN','version':'20261029-admin-1'})
         if path=='/api/settings':return reply({'error':'인증키는 Render Environment의 BUILDING_API_KEY에서 설정하세요.'},403)
         if method=='POST':
             origin=urllib.parse.urlparse(env.get('HTTP_ORIGIN',''))
@@ -55,7 +74,13 @@ def application(env,start_response):
                 return reply(found)
             p=core.land.pnu_valid(q.get('pnu',[''])[0])
             if path=='/api/center':
-                x,y=core.land.parcel_center(p,core.land.map_version(p));return reply({'center':list(core.TO_MAP(x,y))})
+                x,y=core.land.parcel_center(p,core.land.map_version(p))
+                collection='error'
+                try:
+                    address=core.ADDRESSES.get(p) or core.land.land_detail(p)['address']
+                    collection=search_records.record(address)
+                except Exception:pass
+                return reply({'center':list(core.TO_MAP(x,y)),'collectionStatus':collection})
             if path=='/api/ledger':return reply(core.ledger(p))
             address=core.ADDRESSES.get(p) or core.land.land_detail(p)['address']
             return reply(core.land.grid_detail(address,p))
